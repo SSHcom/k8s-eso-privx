@@ -18,6 +18,11 @@ First download this repository and the external-secrets repository, then apply t
     cd external-secrets
     git am ../k8s-eso-privx/eso-patches/*.patch
     # If conflicts, fix them and continue: git am --continue
+    go mod tidy
+```
+If the patch does not succeed, you can checkout the external-secrets git commit last tested befor applying the patch
+```bash
+git checkout d9fd335a20378c47833b9350840b25963854a2be
 ```
 
 Now you can compile and install the ESO according to the ESO developer guide https://external-secrets.io/latest/contributing/devguide/

@@ -7,8 +7,6 @@ Subject: [PATCH] First version of PrivX provider
  .../v1/secretstore_privx_types.go             |  67 +++
  apis/externalsecrets/v1/secretstore_types.go  |   4 +
  docs/provider/privx.md                        | 114 +++++
- go.mod                                        |   1 +
- go.sum                                        |   2 +
  pkg/register/privx.go                         |  30 ++
  providers/v1/privx/client.go                  | 421 ++++++++++++++++
  providers/v1/privx/ed25519.go                 |  54 ++
@@ -231,31 +229,6 @@ index 00000000..a605dd5f
 +
 +## Requirements
 +
-diff --git a/go.mod b/go.mod
-index 09f7ab9e..f7ed4254 100644
---- a/go.mod
-+++ b/go.mod
-@@ -117,6 +117,7 @@ require (
- require github.com/1Password/connect-sdk-go v1.5.3 // indirect
- 
- require (
-+	github.com/SSHcom/privx-sdk-go/v2 v2.42.0
- 	github.com/external-secrets/external-secrets/apis v0.0.0
- 	github.com/external-secrets/external-secrets/generators/v1/acr v0.0.0-00010101000000-000000000000
- 	github.com/external-secrets/external-secrets/generators/v1/cloudsmith v0.0.0-00010101000000-000000000000
-diff --git a/go.sum b/go.sum
-index acacfd8b..26cbaec9 100644
---- a/go.sum
-+++ b/go.sum
-@@ -164,6 +164,8 @@ github.com/ProtonMail/go-mime v0.0.0-20230322103455-7d82a3887f2f h1:tCbYj7/299ek
- github.com/ProtonMail/go-mime v0.0.0-20230322103455-7d82a3887f2f/go.mod h1:gcr0kNtGBqin9zDW9GOHcVntrwnjrK+qdJ06mWYBybw=
- github.com/ProtonMail/gopenpgp/v2 v2.9.0 h1:ruLzBmwe4dR1hdnrsEJ/S7psSBmV15gFttFUPP/+/kE=
- github.com/ProtonMail/gopenpgp/v2 v2.9.0/go.mod h1:IldDyh9Hv1ZCCYatTuuEt1XZJ0OPjxLpTarDfglih7s=
-+github.com/SSHcom/privx-sdk-go/v2 v2.42.0 h1:tcuZoQLoUqyqMFbJnNlRELif5WujuCHQa8RP2ck2wJQ=
-+github.com/SSHcom/privx-sdk-go/v2 v2.42.0/go.mod h1:HOAFT+Xg77BzneJCU2yygLsWds5rmaH2tgbDVQZ9CAI=
- github.com/Shopify/sarama v1.19.0/go.mod h1:FVkBWblsNy7DGZRfXLU0O9RCGt5g3g3yEuWXgklEdEo=
- github.com/Shopify/sarama v1.30.1/go.mod h1:hGgx05L/DiW8XYBXeJdKIN6V2QUy2H6JqME5VT1NLRw=
- github.com/Shopify/toxiproxy v2.1.4+incompatible/go.mod h1:OXgGpZ6Cli1/URJOF1DMxUHB2q5Ap20/P/eIdh4G0pI=
 diff --git a/pkg/register/privx.go b/pkg/register/privx.go
 new file mode 100644
 index 00000000..a5bc8d11
