@@ -20,12 +20,28 @@ First download this repository and the external-secrets repository, then apply t
     # If conflicts, fix them and continue: git am --continue
     go mod tidy
 ```
-If the patch does not succeed, you can checkout the external-secrets git commit last tested befor applying the patch
-```bash
-git checkout d9fd335a20378c47833b9350840b25963854a2be
-```
-
 Now you can compile and install the ESO according to the ESO developer guide https://external-secrets.io/latest/contributing/devguide/
 
 Installing the patches also installs documentation for the PrivX provider, in folder docs/provider/privx.md
 
+## Go versions
+
+If you go version is lower than required by latest ESO version, you can use an older version. Check available tags in the external-secrets repository and see what Go version they use
+
+```bash
+$ git tag
+...
+v1.3.2
+v2.0.0
+v2.0.1
+v2.1.0
+$ git show v2.1.0:go.mod | grep '^go '
+go 1.25.7
+$ git show v2.0.0:go.mod | grep '^go '
+go 1.25.6
+```
+Then you can select a suitable version to apply the patches to
+```bash
+git switch --detach v2.1.0
+```
+Rocky Linux 9 and RHEL 9 for example are limited to Go 1.25.7
