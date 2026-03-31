@@ -1,7 +1,7 @@
-From f26178c27346bf6258abad96c4229e393f2d2663 Mon Sep 17 00:00:00 2001
+From 82fe5968879d366127c6c35d761efdd895aee60a Mon Sep 17 00:00:00 2001
 From: kushssh <kush.kumar@ssh.com>
 Date: Wed, 18 Mar 2026 16:41:24 +0000
-Subject: [PATCH] Update privx.md
+Subject: [PATCH 2/4] Update privx.md
 
 ---
  docs/provider/privx.md | 124 ++++++++++++++++++++++++++++++++++++-----

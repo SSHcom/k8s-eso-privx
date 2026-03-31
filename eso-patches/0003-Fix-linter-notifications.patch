@@ -1,0 +1,642 @@
+From 30846f851de17884af2313425219ed59a9152cfb Mon Sep 17 00:00:00 2001
+From: Mauri Tikka <mauri.tikka@ssh.com>
+Date: Fri, 27 Mar 2026 08:36:09 +0200
+Subject: [PATCH 3/4] Fix linter notifications
+
+---
+ providers/v1/privx/client.go   | 127 ++++++++++++---------------------
+ providers/v1/privx/ed25519.go  |  19 ++++-
+ providers/v1/privx/jwt.go      |  72 ++++++++++++-------
+ providers/v1/privx/provider.go |  87 ++++++++++++++--------
+ 4 files changed, 168 insertions(+), 137 deletions(-)
+
+diff --git a/providers/v1/privx/client.go b/providers/v1/privx/client.go
+index d3ab2458..f862b657 100644
+--- a/providers/v1/privx/client.go
++++ b/providers/v1/privx/client.go
+@@ -1,12 +1,24 @@
+ /*
+-Implement the ESO SecretsClient
++Copyright © 2026 SSH Communications
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
+ */
+ 
++// Package privx implements the ESO SecretsClient for SSH PrivX
+ package privx
+ 
+ import (
+ 	"context"
+-	"encoding/base64"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+@@ -18,20 +30,28 @@ import (
+ 	"github.com/SSHcom/privx-sdk-go/v2/api/rolestore"
+ 	"github.com/SSHcom/privx-sdk-go/v2/api/vault"
+ 	privxapi "github.com/SSHcom/privx-sdk-go/v2/restapi"
+-	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
+ 	corev1 "k8s.io/api/core/v1"
+ 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/log"
++
++	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
+ )
+ 
+ var (
+-	ErrNoName                      = errors.New("No name provided for secret")
++	// ErrNoName is returned when no name is provided for the secret.
++	ErrNoName = errors.New("No name provided for secret")
++
++	// ErrUnsupportedDecodingStrategy is returned when the decoding strategy is not supported.
+ 	ErrUnsupportedDecodingStrategy = errors.New("unsupported decoding strategy")
+-	ErrSecretDataMissing           = errors.New("secret data missing")
+-	ErrPropertyNotFound            = errors.New("property not found in secret")
++
++	// ErrSecretDataMissing is returned when secret data is missing.
++	ErrSecretDataMissing = errors.New("secret data missing")
++
++	// ErrPropertyNotFound is returned when the requested property is not found in the secret.
++	ErrPropertyNotFound = errors.New("property not found in secret")
+ )
+ 
+-// Check during compile that we implement the interface
++// Check during compile that we implement the interface.
+ var _ esv1.SecretsClient = (*SecretsClient)(nil)
+ 
+ // SecretsClient provides access to PrivX secrets.
+@@ -49,6 +69,9 @@ type SecretsClient struct {
+ 
+ // GetSecret returns a single secret from the provider.
+ func (c *SecretsClient) GetSecret(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) ([]byte, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
+ 	secret, err := c.vault.GetSecret(ref.Key)
+ 	if err != nil {
+ 		return nil, err
+@@ -128,6 +151,9 @@ func (c *SecretsClient) PushSecret(ctx context.Context, secret *corev1.Secret, d
+ 
+ // DeleteSecret will delete the secret from PrivX.
+ func (c *SecretsClient) DeleteSecret(ctx context.Context, ref esv1.PushSecretRemoteRef) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
+ 	err := c.vault.DeleteSecret(ref.GetRemoteKey())
+ 	if err == nil {
+ 		return nil
+@@ -140,7 +166,9 @@ func (c *SecretsClient) DeleteSecret(ctx context.Context, ref esv1.PushSecretRem
+ 
+ // SecretExists checks if a secret is already present in PrivX at the given location.
+ func (c *SecretsClient) SecretExists(ctx context.Context, ref esv1.PushSecretRemoteRef) (bool, error) {
+-
++	if err := ctx.Err(); err != nil {
++		return false, err
++	}
+ 	remoteRef := esv1.ExternalSecretDataRemoteRef{Key: ref.GetRemoteKey()}
+ 	_, err := c.GetSecret(context.TODO(), remoteRef)
+ 	if err == nil {
+@@ -159,7 +187,6 @@ func (c *SecretsClient) SecretExists(ctx context.Context, ref esv1.PushSecretRem
+ // and is able to retrieve secrets from the provider.
+ // If the validation result is unknown it will be ignored.
+ func (c *SecretsClient) Validate() (esv1.ValidationResult, error) {
+-
+ 	_, err := c.GetSecret(context.TODO(), esv1.ExternalSecretDataRemoteRef{Key: "2F0vZqCe0Z3XU5"})
+ 
+ 	if isNotFound(err) {
+@@ -179,7 +206,9 @@ func (c *SecretsClient) GetSecretMap(
+ 	ctx context.Context,
+ 	ref esv1.ExternalSecretDataRemoteRef,
+ ) (map[string][]byte, error) {
+-
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
+ 	secret, err := c.vault.GetSecret(ref.Key)
+ 	if err != nil {
+ 		return nil, err
+@@ -241,6 +270,9 @@ func (c *SecretsClient) GetSecretMap(
+ // for that secret (the whole secret.Data marshaled as JSON). This avoids key
+ // collisions between secrets that may contain identical JSON keys internally.
+ func (c *SecretsClient) GetAllSecrets(ctx context.Context, ref esv1.ExternalSecretFind) (map[string][]byte, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
+ 	results := make(map[string][]byte)
+ 
+ 	if ref.Path != nil {
+@@ -309,6 +341,9 @@ func (c *SecretsClient) GetAllSecrets(ctx context.Context, ref esv1.ExternalSecr
+ 
+ // Close closes the client and releases all resources.
+ func (c *SecretsClient) Close(ctx context.Context) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
+ 	// Nothing to close or release.
+ 	return nil
+ }
+@@ -321,40 +356,6 @@ func isNotFound(err error) bool {
+ 	return strings.Contains(strings.ToLower(err.Error()), "secret not found")
+ }
+ 
+-// decode decodes a secret value according to DecodingStrategy
+-//
+-// See https://external-secrets.io/latest/guides/decoding-strategy/
+-func decode(value []byte, strategy esv1.ExternalSecretDecodingStrategy) ([]byte, error) {
+-	switch strategy {
+-	case esv1.ExternalSecretDecodeBase64:
+-		decoded, err := base64.StdEncoding.DecodeString(string(value))
+-		if err != nil {
+-			return nil, err
+-		}
+-		return decoded, nil
+-	case esv1.ExternalSecretDecodeBase64URL:
+-		decoded, err := base64.URLEncoding.DecodeString(string(value))
+-		if err != nil {
+-			return nil, err
+-		}
+-		return decoded, nil
+-	case esv1.ExternalSecretDecodeNone, "":
+-		return value, nil
+-	case esv1.ExternalSecretDecodeAuto:
+-		decoded, err := decode(value, esv1.ExternalSecretDecodeBase64)
+-		if err == nil {
+-			return decoded, nil
+-		}
+-		decoded, err = decode(value, esv1.ExternalSecretDecodeBase64URL)
+-		if err == nil {
+-			return decoded, nil
+-		}
+-		return value, nil
+-	default:
+-		return nil, fmt.Errorf("%w: %v", ErrUnsupportedDecodingStrategy, strategy)
+-	}
+-}
+-
+ // anyToBytes converts a JSON-unmarshaled value (interface{}) to []byte.
+ func anyToBytes(v any) ([]byte, error) {
+ 	switch t := v.(type) {
+@@ -381,41 +382,3 @@ func anyToBytes(v any) ([]byte, error) {
+ 		return json.Marshal(t)
+ 	}
+ }
+-
+-// rawToBytes converts a json.RawMessage into a byte slice suitable for secret return values.
+-func rawToBytes(raw json.RawMessage) ([]byte, error) {
+-	var v any
+-	if err := json.Unmarshal(raw, &v); err != nil {
+-		return nil, err
+-	}
+-	return anyToBytes(v)
+-}
+-
+-// // convertValue converts a secret value based on the conversion strategy.
+-// func convertValue(value []byte, strategy esv1.ExternalSecretConversionStrategy) ([]byte, error) {
+-// 	switch strategy {
+-// 	case esv1.ExternalSecretConversionDefault, "":
+-// 		return value, nil
+-// 	case esv1.ExternalSecretConversionUnicode:
+-// 		if !utf8.Valid(value) {
+-// 			return nil, fmt.Errorf("secret value is not valid UTF-8")
+-// 		}
+-// 		return []byte(string(value)), nil
+-// 	default:
+-// 		return value, nil
+-// 	}
+-// }
+-
+-// // rawMessageToByteMap converts a raw JSON to a byte map. The values remain raw.
+-// func rawMessageToByteMap(raw json.RawMessage) (map[string][]byte, error) {
+-// 	var tmp map[string]json.RawMessage
+-// 	if err := json.Unmarshal(raw, &tmp); err != nil {
+-// 		return nil, err
+-// 	}
+-
+-// 	out := make(map[string][]byte, len(tmp))
+-// 	for k, v := range tmp {
+-// 		out[k] = v // json.RawMessage == []byte
+-// 	}
+-// 	return out, nil
+-// }
+diff --git a/providers/v1/privx/ed25519.go b/providers/v1/privx/ed25519.go
+index 017804ce..e712d280 100644
+--- a/providers/v1/privx/ed25519.go
++++ b/providers/v1/privx/ed25519.go
+@@ -1,6 +1,19 @@
+ /*
+-This class it to circumvent alg:ed25519 expectation of PrivX
++Copyright © 2026 SSH Communications
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
+ */
++
+ package privx
+ 
+ import (
+@@ -12,9 +25,11 @@ import (
+ )
+ 
+ var (
++	// ErrEd25519KeyType is returned when the Ed25519 key type does not match the expected type.
+ 	ErrEd25519KeyType = errors.New("Ed25519 key type mismatch")
+ )
+ 
++// signingMethodEd25519 is to circumvent alg:ed25519 expectation of PrivX.
+ type signingMethodEd25519 struct{}
+ 
+ func (m signingMethodEd25519) Alg() string { return "Ed25519" }
+@@ -48,7 +63,7 @@ func init() {
+ 	})
+ }
+ 
+-// Optional: helper if you want a handle without relying on init order.
++// SigningMethodEd25519 is an optional helper if you want a handle without relying on init order.
+ func SigningMethodEd25519() jwt.SigningMethod {
+ 	return signingMethodEd25519{}
+ }
+diff --git a/providers/v1/privx/jwt.go b/providers/v1/privx/jwt.go
+index cde05799..5af5f4c4 100644
+--- a/providers/v1/privx/jwt.go
++++ b/providers/v1/privx/jwt.go
+@@ -1,3 +1,19 @@
++/*
++Copyright © 2026 SSH Communications
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
+ package privx
+ 
+ import (
+@@ -19,7 +35,6 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	v1 "github.com/external-secrets/external-secrets/apis/meta/v1"
+ 	"github.com/go-logr/logr"
+ 	jwt "github.com/golang-jwt/jwt/v5"
+ 	authenticationv1 "k8s.io/api/authentication/v1"
+@@ -28,20 +43,27 @@ import (
+ 	"k8s.io/client-go/rest"
+ 	"k8s.io/utils/ptr"
+ 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
++
++	v1 "github.com/external-secrets/external-secrets/apis/meta/v1"
+ )
+ 
+ var (
+-	ErrInvalidPEMBlock          = errors.New("invalid PEM block")
++	// ErrInvalidPEMBlock is returned when the PEM block is invalid or cannot be decoded.
++	ErrInvalidPEMBlock = errors.New("invalid PEM block")
++
++	// ErrUnsupportedPrivateKeyAlg is returned when the private key algorithm is not supported.
+ 	ErrUnsupportedPrivateKeyAlg = errors.New("unsupported private key algorithm")
+-	ErrUnsupportedPEMBlockType  = errors.New("unsupported PEM block type")
++
++	// ErrUnsupportedPEMBlockType is returned when the PEM block type is not supported.
++	ErrUnsupportedPEMBlockType = errors.New("unsupported PEM block type")
+ )
+ 
+ var (
+-	ErrPrivXTokenExchangeBuildRequest = errors.New("privx token exchange: build request")
+-	ErrPrivXTokenExchangeDoRequest    = errors.New("privx token exchange: do request")
+-	ErrPrivXTokenExchangeBadStatus    = errors.New("privx token exchange: bad http status")
+-	ErrPrivXTokenExchangeReadBody     = errors.New("privx token exchange: read response body")
+-	ErrPrivXTokenExchangeDecodeJSON   = errors.New("privx token exchange: decode json")
++	// ErrPrivXTokenExchangeBadStatus is returned when the PrivX token exchange returns a non-success HTTP status.
++	ErrPrivXTokenExchangeBadStatus = errors.New("privx token exchange: bad http status")
++
++	// ErrTokenEmpty is returned when the access token is empty.
++	ErrTokenEmpty = errors.New("token debug: empty access token")
+ )
+ 
+ // ExchangeTokenRequest matches PrivX token exchange request fields.
+@@ -79,7 +101,7 @@ func ExchangeToken(
+ 	baseURL = strings.TrimRight(baseURL, "/")
+ 	if reqBody.Token == "" {
+ 		// Keep it simple: server will also reject, but client-side guard is useful.
+-		return out, fmt.Errorf("%w: empty token", ErrPrivXTokenExchangeBuildRequest)
++		return out, fmt.Errorf("%w: empty token", ErrTokenEmpty)
+ 	}
+ 	if httpClient == nil {
+ 		httpClient = &http.Client{Timeout: 30 * time.Second}
+@@ -87,26 +109,26 @@ func ExchangeToken(
+ 
+ 	bodyBytes, err := json.Marshal(reqBody)
+ 	if err != nil {
+-		return out, fmt.Errorf("%w: marshal: %v", ErrPrivXTokenExchangeBuildRequest, err)
++		return out, fmt.Errorf("marshal: %w", err)
+ 	}
+ 
+ 	url := baseURL + "/auth/api/v1/token/login"
+ 	r, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+ 	if err != nil {
+-		return out, fmt.Errorf("%w: %v", ErrPrivXTokenExchangeBuildRequest, err)
++		return out, fmt.Errorf("privx token exchange: build request: %w", err)
+ 	}
+ 	r.Header.Set("Content-Type", "application/json")
+ 	r.Header.Set("Accept", "application/json")
+ 
+ 	resp, err := httpClient.Do(r)
+ 	if err != nil {
+-		return out, fmt.Errorf("%w: %v", ErrPrivXTokenExchangeDoRequest, err)
++		return out, fmt.Errorf("privx token exchange: do request: %w", err)
+ 	}
+-	defer resp.Body.Close()
++	defer func() { _ = resp.Body.Close() }()
+ 
+ 	respBody, err := io.ReadAll(resp.Body)
+ 	if err != nil {
+-		return out, fmt.Errorf("%w: %v", ErrPrivXTokenExchangeReadBody, err)
++		return out, fmt.Errorf("privx token exchange: read response body: %w", err)
+ 	}
+ 
+ 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+@@ -119,7 +141,7 @@ func ExchangeToken(
+ 	}
+ 
+ 	if err := json.Unmarshal(respBody, &out); err != nil {
+-		return out, fmt.Errorf("%w: %v; body=%s", ErrPrivXTokenExchangeDecodeJSON, err, strings.TrimSpace(string(respBody)))
++		return out, fmt.Errorf("privx token exchange: decode json: %w; body=%s", err, strings.TrimSpace(string(respBody)))
+ 	}
+ 
+ 	return out, nil
+@@ -188,7 +210,11 @@ func createSignedJWT(
+ // - privateKeyRef must point to a PEM-encoded RSA key (PKCS#1 or PKCS#8) stored in Secret.Data[ref.Key].
+ // - aud is written as a JSON string (not an array) by using MapClaims.
+ // - extraClaims are merged into the token claims (cannot overwrite reserved keys unless you do it explicitly).
+-func createSignedJWT_RS256(
++//
++// This function will be useful in future versions of PrivX
++//
++//nolint:unused
++func createSignedJWTRS256(
+ 	ctx context.Context,
+ 	client kclient.Client,
+ 	namespace string,
+@@ -199,6 +225,9 @@ func createSignedJWT_RS256(
+ 	ttl time.Duration,
+ 	extraClaims map[string]any,
+ ) (string, error) {
++	if err := ctx.Err(); err != nil {
++		return "", err
++	}
+ 	// Read PEM from Kubernetes Secret
+ 	pemStr, err := readSecretValue(ctx, client, namespace, privateKeyRef)
+ 	if err != nil {
+@@ -240,7 +269,6 @@ func createSignedJWT_RS256(
+ 
+ // getJWTFromPod reads the ServiceAccount JWT mounted into every pod by Kubernetes.
+ func getJWTFromPod() (string, error) {
+-
+ 	b, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+ 	if err != nil {
+ 		return "", fmt.Errorf("read serviceaccount token: %w", err)
+@@ -433,15 +461,11 @@ func detectJWTSigningKey(pemBytes []byte) (jwt.SigningMethod, any, error) {
+ 	}
+ }
+ 
+-var (
+-	ErrTokenEmpty = errors.New("token debug: empty access token")
+-)
+-
+ // LogOpaqueTokenResponse logs metadata of an OAuth token safely.
+ // The access token itself is never logged. Instead, a short SHA256 fingerprint is logged.
+-func logTokenResponse(logger logr.Logger, tr TokenResponse) error {
++func logTokenResponse(logger logr.Logger, tr TokenResponse) {
+ 	if tr.AccessToken == "" {
+-		return ErrTokenEmpty
++		logger.Info("oauth token response is empty")
+ 	}
+ 
+ 	hash := sha256.Sum256([]byte(tr.AccessToken))
+@@ -455,6 +479,4 @@ func logTokenResponse(logger logr.Logger, tr TokenResponse) error {
+ 		"accessTokenLen", len(tr.AccessToken),
+ 		"accessTokenFingerprint", fingerprint,
+ 	)
+-
+-	return nil
+ }
+diff --git a/providers/v1/privx/provider.go b/providers/v1/privx/provider.go
+index 1c450278..ca6a5bef 100644
+--- a/providers/v1/privx/provider.go
++++ b/providers/v1/privx/provider.go
+@@ -1,6 +1,19 @@
+ /*
+-Implement the ESO Provider.
++Copyright © 2026 SSH Communications
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
+ */
++
+ package privx
+ 
+ import (
+@@ -12,32 +25,58 @@ import (
+ 	"github.com/SSHcom/privx-sdk-go/v2/api/vault"
+ 	"github.com/SSHcom/privx-sdk-go/v2/oauth"
+ 	privxapi "github.com/SSHcom/privx-sdk-go/v2/restapi"
+-	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
+-	v1 "github.com/external-secrets/external-secrets/apis/meta/v1"
+ 	corev1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
+ 	"sigs.k8s.io/controller-runtime/pkg/log"
+ 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
++
++	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
++	v1 "github.com/external-secrets/external-secrets/apis/meta/v1"
+ )
+ 
+ var (
+-	ErrNotImplemented             = errors.New("not implemented")
+-	ErrInvalidJson                = errors.New("invalid JSON")
+-	ErrInvalidJWT                 = errors.New("failed to decode JWT")
+-	ErrEmptyAudience              = errors.New("audience is empty")
+-	ErrReadNamespace              = errors.New("failed to read namespace")
+-	ErrReadServiceAccount         = errors.New("failed to read serviceaccount name")
+-	ErrInClusterConfig            = errors.New("failed to create in-cluster config")
+-	ErrKubernetesClient           = errors.New("failed to create kubernetes client")
+-	ErrCreateToken                = errors.New("failed to create serviceaccount token")
+-	ErrEmptyReturnedToken         = errors.New("empty token returned")
+-	ErrInvalidJWTFormat           = errors.New("invalid jwt format")
+-	ErrDecodeJWTPayload           = errors.New("failed to decode jwt payload")
+-	ErrParseJWTPayload            = errors.New("failed to parse jwt payload json")
++	// ErrNotImplemented is returned when the requested functionality is not implemented.
++	ErrNotImplemented = errors.New("not implemented")
++
++	// ErrInvalidJSON is returned when JSON decoding fails.
++	ErrInvalidJSON = errors.New("invalid JSON")
++
++	// ErrEmptyAudience is returned when the audience value is empty.
++	ErrEmptyAudience = errors.New("audience is empty")
++
++	// ErrReadNamespace is returned when reading the namespace fails.
++	ErrReadNamespace = errors.New("failed to read namespace")
++
++	// ErrReadServiceAccount is returned when reading the service account name fails.
++	ErrReadServiceAccount = errors.New("failed to read serviceaccount name")
++
++	// ErrInClusterConfig is returned when creating in-cluster Kubernetes config fails.
++	ErrInClusterConfig = errors.New("failed to create in-cluster config")
++
++	// ErrKubernetesClient is returned when creating the Kubernetes client fails.
++	ErrKubernetesClient = errors.New("failed to create kubernetes client")
++
++	// ErrCreateToken is returned when creating a service account token fails.
++	ErrCreateToken = errors.New("failed to create serviceaccount token")
++
++	// ErrEmptyReturnedToken is returned when the token returned by the API is empty.
++	ErrEmptyReturnedToken = errors.New("empty token returned")
++
++	// ErrInvalidJWTFormat is returned when the JWT format is invalid.
++	ErrInvalidJWTFormat = errors.New("invalid jwt format")
++
++	// ErrDecodeJWTPayload is returned when decoding the JWT payload fails.
++	ErrDecodeJWTPayload = errors.New("failed to decode jwt payload")
++
++	// ErrParseJWTPayload is returned when parsing the JWT payload JSON fails.
++	ErrParseJWTPayload = errors.New("failed to parse jwt payload json")
++
++	// ErrServiceAccountNameNotFound is returned when the service account name is not found in JWT claims.
+ 	ErrServiceAccountNameNotFound = errors.New("serviceaccount name not found in jwt claims")
+ )
+ 
++// ErrNoStoreAuth is an error returned which details what is missing from authorisation.
+ type ErrNoStoreAuth struct {
+ 	Field string
+ }
+@@ -63,7 +102,6 @@ func readSecretValue(
+ 	namespace string,
+ 	ref v1.SecretKeySelector,
+ ) (string, error) {
+-
+ 	var secret corev1.Secret
+ 	if err := client.Get(ctx, types.NamespacedName{
+ 		Namespace: namespace,
+@@ -77,9 +115,6 @@ func readSecretValue(
+ 		return "", fmt.Errorf("secret %s/%s missing key %q", namespace, ref.Name, ref.Key)
+ 	}
+ 
+-	// logger := log.FromContext(ctx)
+-	// logger.Info("Secret value for debugging", "key", ref.Key, "value", string(b))
+-
+ 	return string(b), nil
+ }
+ 
+@@ -90,7 +125,6 @@ func privxAuth(
+ 	namespace string,
+ 	privxSpec *esv1.PrivxProvider,
+ ) (privxapi.Authorizer, error) {
+-
+ 	auth := privxapi.New(
+ 		privxapi.BaseURL(privxSpec.Host),
+ 	)
+@@ -176,12 +210,10 @@ func privxAuth(
+ 			// map[string]any{"domain": "privx-service"},
+ 		)
+ 	} else {
+-
+ 		// No OAuth tokens, no public key, use JWT with Kubernetes signature
+ 		// PrivX 44 or later
+ 		// "may not specify a duration less than 10 minutes"
+ 		token, err = getAudienceJWTFromPod(ctx, privxSpec.Host, 15*time.Minute)
+-
+ 	}
+ 	if err != nil {
+ 		return nil, err
+@@ -190,7 +222,7 @@ func privxAuth(
+ 	// Logging
+ 	decoded, err := decodeJWT(token)
+ 	if err != nil {
+-		return nil, fmt.Errorf("%w: %v", ErrInvalidJWT, err)
++		return nil, fmt.Errorf("failed to decode JWT: %w", err)
+ 	}
+ 	logger := log.FromContext(ctx)
+ 	logger.Info("JWT token", "claims", decoded)
+@@ -202,7 +234,7 @@ func privxAuth(
+ 		return nil, err
+ 	}
+ 
+-	err = logTokenResponse(logger, tokenResponse)
++	logTokenResponse(logger, tokenResponse)
+ 	return oauth.WithToken("Bearer " + tokenResponse.AccessToken), nil
+ }
+ 
+@@ -213,7 +245,6 @@ func privxAPI(
+ 	namespace string,
+ 	privxSpec *esv1.PrivxProvider,
+ ) (privxapi.Connector, error) {
+-
+ 	auth, err := privxAuth(ctx, kube, namespace, privxSpec)
+ 	if err != nil {
+ 		return nil, err
+@@ -232,7 +263,6 @@ func (p *Provider) NewClient(
+ 	kube kclient.Client,
+ 	namespace string,
+ ) (esv1.SecretsClient, error) {
+-
+ 	config := store.GetSpec().Provider.PrivX
+ 	conn, err := privxAPI(ctx, kube, namespace, config)
+ 	if err != nil {
+@@ -251,8 +281,8 @@ func (p *Provider) NewClient(
+ 	return &client, nil
+ }
+ 
++// ValidateStore checks the configuration.
+ func (p *Provider) ValidateStore(store esv1.GenericStore) (admission.Warnings, error) {
+-
+ 	if store.GetSpec().Provider == nil {
+ 		return nil, ErrNoStoreAuth{Field: "spec.provider"}
+ 	}
+@@ -275,6 +305,7 @@ func (p *Provider) ValidateStore(store esv1.GenericStore) (admission.Warnings, e
+ 	return nil, nil
+ }
+ 
++// Capabilities indicates, if store is read-only or read-write.
+ func (p *Provider) Capabilities() esv1.SecretStoreCapabilities {
+ 	return esv1.SecretStoreReadWrite
+ }
+-- 
+2.47.3
+

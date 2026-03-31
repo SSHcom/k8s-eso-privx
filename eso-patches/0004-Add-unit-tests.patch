@@ -1,0 +1,2012 @@
+From 41b67f517c2d6fb73c57bf44cb67d4667d5da7fc Mon Sep 17 00:00:00 2001
+From: Mauri Tikka <mauri.tikka@ssh.com>
+Date: Sun, 29 Mar 2026 20:44:19 +0300
+Subject: [PATCH 4/4] Add unit tests
+
+---
+ providers/v1/privx/client.go                 |   4 +-
+ providers/v1/privx/client_test.go            | 884 +++++++++++++++++++
+ providers/v1/privx/fake_client_test.go       |  92 ++
+ providers/v1/privx/fake_vault_client_test.go | 164 ++++
+ providers/v1/privx/jwt_test.go               | 416 +++++++++
+ providers/v1/privx/provider.go               |  32 +-
+ providers/v1/privx/provider_test.go          | 181 ++++
+ providers/v1/privx/vault_client.go           | 128 +++
+ 8 files changed, 1896 insertions(+), 5 deletions(-)
+ create mode 100644 providers/v1/privx/client_test.go
+ create mode 100644 providers/v1/privx/fake_client_test.go
+ create mode 100644 providers/v1/privx/fake_vault_client_test.go
+ create mode 100644 providers/v1/privx/jwt_test.go
+ create mode 100644 providers/v1/privx/provider_test.go
+ create mode 100644 providers/v1/privx/vault_client.go
+
+diff --git a/providers/v1/privx/client.go b/providers/v1/privx/client.go
+index f862b657..8b02571d 100644
+--- a/providers/v1/privx/client.go
++++ b/providers/v1/privx/client.go
+@@ -57,7 +57,7 @@ var _ esv1.SecretsClient = (*SecretsClient)(nil)
+ // SecretsClient provides access to PrivX secrets.
+ type SecretsClient struct {
+ 	conn      privxapi.Connector
+-	vault     *vault.Vault // PrivX Vault instance
++	vault     VaultClient // PrivX Vault instance, or a fake test client
+ 	store     esv1.GenericStore
+ 	kube      kclient.Client
+ 	namespace string
+@@ -281,7 +281,7 @@ func (c *SecretsClient) GetAllSecrets(ctx context.Context, ref esv1.ExternalSecr
+ 	if ref.Tags != nil {
+ 		return results, fmt.Errorf("parameter %q: %w", "ref.Tags", ErrNotImplemented)
+ 	}
+-	if ref.ConversionStrategy != esv1.ExternalSecretConversionDefault {
++	if ref.ConversionStrategy != "" && ref.ConversionStrategy != esv1.ExternalSecretConversionDefault {
+ 		return results, fmt.Errorf("parameter %q: %w", "ref.ConversionStrategy", ErrNotImplemented)
+ 	}
+ 
+diff --git a/providers/v1/privx/client_test.go b/providers/v1/privx/client_test.go
+new file mode 100644
+index 00000000..1d8bbf5e
+--- /dev/null
++++ b/providers/v1/privx/client_test.go
+@@ -0,0 +1,884 @@
++/*
++Copyright © 2026 SSH Communications
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package privx
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"regexp/syntax"
++	"testing"
++
++	"github.com/SSHcom/privx-sdk-go/v2/api/filters"
++	"github.com/SSHcom/privx-sdk-go/v2/api/response"
++	"github.com/SSHcom/privx-sdk-go/v2/api/vault"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	corev1 "k8s.io/api/core/v1"
++	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
++)
++
++func TestSecretsClientGetSecret(t *testing.T) {
++	tests := map[string]struct {
++		ref     esv1.ExternalSecretDataRemoteRef
++		fake    *fakeVaultClient
++		want    []byte
++		wantErr error
++	}{
++		"returns selected property": {
++			ref: esv1.ExternalSecretDataRemoteRef{
++				Key:      "example",
++				Property: "username",
++			},
++			fake: &fakeVaultClient{
++				getSecretFn: func(secretName string) (*vault.Secret, error) {
++					data := map[string]any{
++						"username": "alice",
++						"password": "secret",
++					}
++					return &vault.Secret{
++						SecretRequest: vault.SecretRequest{
++							Data: &data,
++						},
++					}, nil
++				},
++			},
++			want:    []byte("alice"),
++			wantErr: nil,
++		},
++		"returns property not found": {
++			ref: esv1.ExternalSecretDataRemoteRef{
++				Key:      "example",
++				Property: "missing",
++			},
++			fake: &fakeVaultClient{
++				getSecretFn: func(secretName string) (*vault.Secret, error) {
++					data := map[string]any{
++						"username": "alice",
++					}
++					return &vault.Secret{
++						SecretRequest: vault.SecretRequest{
++							Data: &data,
++						},
++					}, nil
++				},
++			},
++			want:    nil,
++			wantErr: ErrPropertyNotFound,
++		},
++	}
++
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			c := &SecretsClient{
++				vault: tc.fake,
++			}
++
++			got, err := c.GetSecret(context.Background(), tc.ref)
++
++			if tc.wantErr != nil {
++				require.Error(t, err)
++				assert.ErrorIs(t, err, tc.wantErr)
++				assert.Nil(t, got)
++				return
++			}
++
++			require.NoError(t, err)
++			assert.Equal(t, tc.want, got)
++		})
++	}
++}
++
++func TestSecretsClientGetSecret_ReturnsWholeObject(t *testing.T) {
++	c := &SecretsClient{
++		vault: &fakeVaultClient{
++			getSecretFn: func(secretName string) (*vault.Secret, error) {
++				data := map[string]any{
++					"username": "alice",
++					"enabled":  true,
++				}
++				return &vault.Secret{
++					SecretRequest: vault.SecretRequest{
++						Data: &data,
++					},
++				}, nil
++			},
++		},
++	}
++
++	got, err := c.GetSecret(context.Background(), esv1.ExternalSecretDataRemoteRef{
++		Key: "example",
++	})
++
++	require.NoError(t, err)
++	assert.JSONEq(t, `{"enabled":true,"username":"alice"}`, string(got))
++}
++
++func TestSecretsClientGetSecret_DataMissing(t *testing.T) {
++	c := &SecretsClient{
++		vault: &fakeVaultClient{
++			getSecretFn: func(secretName string) (*vault.Secret, error) {
++				return &vault.Secret{}, nil
++			},
++		},
++	}
++
++	got, err := c.GetSecret(context.Background(), esv1.ExternalSecretDataRemoteRef{
++		Key: "example",
++	})
++
++	require.Error(t, err)
++	assert.ErrorIs(t, err, ErrSecretDataMissing)
++	assert.Nil(t, got)
++}
++
++type fakePushSecretData struct {
++	secretKey string
++	remoteKey string
++	property  string
++}
++
++func (f *fakePushSecretData) GetMetadata() *apiextensionsv1.JSON {
++	return nil
++}
++
++func (f *fakePushSecretData) GetSecretKey() string {
++	return f.secretKey
++}
++
++func (f *fakePushSecretData) GetRemoteKey() string {
++	return f.remoteKey
++}
++
++func (f *fakePushSecretData) GetProperty() string {
++	return f.property
++}
++
++func TestSecretsClientPushSecret(t *testing.T) {
++	tests := map[string]struct {
++		secret  *corev1.Secret
++		data    esv1.PushSecretData
++		fake    *fakeVaultClient
++		wantErr error
++	}{
++		"missing name": {
++			secret: &corev1.Secret{
++				ObjectMeta: metav1.ObjectMeta{Name: ""},
++				Data:       map[string][]byte{"key": []byte("value")},
++			},
++			data: &fakePushSecretData{
++				secretKey: "key",
++				remoteKey: "",
++			},
++			wantErr: ErrNoName,
++		},
++		"success with remote key": {
++			secret: &corev1.Secret{
++				ObjectMeta: metav1.ObjectMeta{Name: "local"},
++				Data:       map[string][]byte{"key": []byte("value")},
++			},
++			data: &fakePushSecretData{
++				secretKey: "key",
++				remoteKey: "remote-name",
++			},
++			fake: &fakeVaultClient{
++				createSecretFn: func(req *vault.SecretRequest) (vault.SecretCreate, error) {
++					return vault.SecretCreate{}, nil
++				},
++			},
++		},
++		"error from vault": {
++			secret: &corev1.Secret{
++				ObjectMeta: metav1.ObjectMeta{Name: "local"},
++				Data:       map[string][]byte{"key": []byte("value")},
++			},
++			data: &fakePushSecretData{
++				secretKey: "key",
++				remoteKey: "remote-name",
++			},
++			fake: &fakeVaultClient{
++				createSecretFn: func(req *vault.SecretRequest) (vault.SecretCreate, error) {
++					return vault.SecretCreate{}, ErrNotImplemented
++				},
++			},
++			wantErr: ErrNotImplemented,
++		},
++	}
++
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			if tc.fake == nil {
++				tc.fake = &fakeVaultClient{}
++			}
++
++			c := &SecretsClient{
++				vault: tc.fake,
++			}
++
++			err := c.PushSecret(context.Background(), tc.secret, tc.data)
++
++			if tc.wantErr != nil {
++				require.Error(t, err)
++				assert.ErrorIs(t, err, tc.wantErr)
++				return
++			}
++
++			require.NoError(t, err)
++		})
++	}
++}
++
++type fakePushSecretRemoteRef struct {
++	remoteKey string
++	property  string
++}
++
++func (f *fakePushSecretRemoteRef) GetRemoteKey() string {
++	return f.remoteKey
++}
++
++func (f *fakePushSecretRemoteRef) GetProperty() string {
++	return f.property
++}
++
++func TestSecretsClientDeleteSecret(t *testing.T) {
++	tests := map[string]struct {
++		ctx      context.Context
++		ref      esv1.PushSecretRemoteRef
++		fake     *fakeVaultClient
++		wantErr  error
++		errCheck func(t *testing.T, err error)
++	}{
++		"ok": {
++			ctx: context.Background(),
++			ref: &fakePushSecretRemoteRef{
++				remoteKey: "example-secret",
++			},
++			fake: &fakeVaultClient{
++				deleteSecretFn: func(secretName string) error {
++					assert.Equal(t, "example-secret", secretName)
++					return nil
++				},
++			},
++		},
++		"not found is ignored": {
++			ctx: context.Background(),
++			ref: &fakePushSecretRemoteRef{
++				remoteKey: "missing-secret",
++			},
++			fake: &fakeVaultClient{
++				deleteSecretFn: func(secretName string) error {
++					assert.Equal(t, "missing-secret", secretName)
++					return errors.New("Secret not found")
++				},
++			},
++		},
++		"other error is returned": {
++			ctx: context.Background(),
++			ref: &fakePushSecretRemoteRef{
++				remoteKey: "broken-secret",
++			},
++			fake: &fakeVaultClient{
++				deleteSecretFn: func(secretName string) error {
++					return ErrNotImplemented
++				},
++			},
++			wantErr: ErrNotImplemented,
++		},
++	}
++
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			c := &SecretsClient{
++				vault: tc.fake,
++			}
++
++			err := c.DeleteSecret(tc.ctx, tc.ref)
++
++			if tc.errCheck != nil {
++				tc.errCheck(t, err)
++				return
++			}
++
++			if tc.wantErr != nil {
++				require.Error(t, err)
++				assert.ErrorIs(t, err, tc.wantErr)
++				return
++			}
++
++			require.NoError(t, err)
++		})
++	}
++}
++
++func TestSecretsClientGetAllSecrets(t *testing.T) {
++	tests := map[string]struct {
++		ctx      context.Context
++		ref      esv1.ExternalSecretFind
++		fake     *fakeVaultClient
++		want     map[string][]byte
++		wantErr  error
++		errCheck func(t *testing.T, err error)
++	}{
++		"context cancelled": {
++			ctx: func() context.Context {
++				ctx, cancel := context.WithCancel(context.Background())
++				cancel()
++				return ctx
++			}(),
++			ref:     esv1.ExternalSecretFind{},
++			fake:    &fakeVaultClient{},
++			want:    nil,
++			wantErr: context.Canceled,
++		},
++		"path not implemented": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretFind{
++				Path: ptrTo("some/path"),
++			},
++			fake:    &fakeVaultClient{},
++			want:    map[string][]byte{},
++			wantErr: ErrNotImplemented,
++		},
++		"tags not implemented": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretFind{
++				Tags: map[string]string{"env": "dev"},
++			},
++			fake:    &fakeVaultClient{},
++			want:    map[string][]byte{},
++			wantErr: ErrNotImplemented,
++		},
++		"conversion strategy not implemented": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretFind{
++				ConversionStrategy: esv1.ExternalSecretConversionUnicode,
++			},
++			fake:    &fakeVaultClient{},
++			want:    map[string][]byte{},
++			wantErr: ErrNotImplemented,
++		},
++		"invalid regexp": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretFind{
++				Name: &esv1.FindName{
++					RegExp: "[",
++				},
++			},
++			fake: &fakeVaultClient{},
++			errCheck: func(t *testing.T, err error) {
++				require.Error(t, err)
++				assert.Contains(t, err.Error(), "invalid regex")
++
++				var synErr *syntax.Error
++				require.ErrorAs(t, err, &synErr)
++			},
++		},
++		"get secrets returns error": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretFind{},
++			fake: &fakeVaultClient{
++				getSecretsFn: func(opts ...filters.Option) (*response.ResultSet[vault.Secret], error) {
++					return nil, ErrNotImplemented
++				},
++			},
++			want:    map[string][]byte{},
++			wantErr: ErrNotImplemented,
++		},
++		"get secret returns error": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretFind{},
++			fake: &fakeVaultClient{
++				getSecretsFn: func(opts ...filters.Option) (*response.ResultSet[vault.Secret], error) {
++					return &response.ResultSet[vault.Secret]{
++						Count: 1,
++						Items: []vault.Secret{
++							{
++								SecretRequest: vault.SecretRequest{
++									Name: "alpha",
++								},
++							},
++						},
++					}, nil
++				},
++				getSecretFn: func(secretName string) (*vault.Secret, error) {
++					return nil, ErrNotImplemented
++				},
++			},
++			want:    map[string][]byte{},
++			wantErr: ErrNotImplemented,
++		},
++		"secret data missing": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretFind{},
++			fake: &fakeVaultClient{
++				getSecretsFn: func(opts ...filters.Option) (*response.ResultSet[vault.Secret], error) {
++					return &response.ResultSet[vault.Secret]{
++						Count: 1,
++						Items: []vault.Secret{
++							{
++								SecretRequest: vault.SecretRequest{
++									Name: "alpha",
++								},
++							},
++						},
++					}, nil
++				},
++				getSecretFn: func(secretName string) (*vault.Secret, error) {
++					return &vault.Secret{}, nil
++				},
++			},
++			want:    map[string][]byte{},
++			wantErr: ErrSecretDataMissing,
++		},
++		"returns matching secrets as json": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretFind{
++				Name: &esv1.FindName{
++					RegExp: "^app-",
++				},
++			},
++			fake: &fakeVaultClient{
++				getSecretsFn: func(opts ...filters.Option) (*response.ResultSet[vault.Secret], error) {
++					return &response.ResultSet[vault.Secret]{
++						Count: 2,
++						Items: []vault.Secret{
++							{
++								SecretRequest: vault.SecretRequest{
++									Name: "app-one",
++								},
++							},
++							{
++								SecretRequest: vault.SecretRequest{
++									Name: "db-one",
++								},
++							},
++						},
++					}, nil
++				},
++				getSecretFn: func(secretName string) (*vault.Secret, error) {
++					switch secretName {
++					case "app-one":
++						data := map[string]interface{}{
++							"username": "alice",
++							"enabled":  true,
++						}
++						return &vault.Secret{
++							SecretRequest: vault.SecretRequest{
++								Data: &data,
++							},
++						}, nil
++					default:
++						t.Fatalf("unexpected secret name: %s", secretName)
++						return nil, nil
++					}
++				},
++			},
++			want: map[string][]byte{
++				"app-one": []byte(`{"enabled":true,"username":"alice"}`),
++			},
++			wantErr: nil,
++		},
++		"empty regexp matches all": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretFind{},
++			fake: &fakeVaultClient{
++				getSecretsFn: func(opts ...filters.Option) (*response.ResultSet[vault.Secret], error) {
++					return &response.ResultSet[vault.Secret]{
++						Count: 1,
++						Items: []vault.Secret{
++							{
++								SecretRequest: vault.SecretRequest{
++									Name: "alpha",
++								},
++							},
++						},
++					}, nil
++				},
++				getSecretFn: func(secretName string) (*vault.Secret, error) {
++					data := map[string]interface{}{
++						"key": "value",
++					}
++					return &vault.Secret{
++						SecretRequest: vault.SecretRequest{
++							Data: &data,
++						},
++					}, nil
++				},
++			},
++			want: map[string][]byte{
++				"alpha": []byte(`{"key":"value"}`),
++			},
++			wantErr: nil,
++		},
++	}
++
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			c := &SecretsClient{
++				vault: tc.fake,
++			}
++
++			got, err := c.GetAllSecrets(tc.ctx, tc.ref)
++
++			if tc.errCheck != nil {
++				tc.errCheck(t, err)
++				if tc.want != nil {
++					assert.Equal(t, tc.want, got)
++				}
++				return
++			}
++
++			if tc.wantErr != nil {
++				require.Error(t, err)
++				assert.ErrorIs(t, err, tc.wantErr)
++				if tc.want != nil {
++					assert.Equal(t, tc.want, got)
++				}
++				return
++			}
++
++			require.NoError(t, err)
++			require.Len(t, got, len(tc.want))
++
++			for key, wantJSON := range tc.want {
++				gotJSON, ok := got[key]
++				require.True(t, ok, "missing key %q", key)
++				assert.JSONEq(t, string(wantJSON), string(gotJSON))
++			}
++		})
++	}
++}
++
++func ptrTo[T any](v T) *T {
++	return &v
++}
++
++func TestSecretsClientGetSecretMap(t *testing.T) {
++	tests := map[string]struct {
++		ctx      context.Context
++		ref      esv1.ExternalSecretDataRemoteRef
++		fake     *fakeVaultClient
++		want     map[string][]byte
++		wantErr  error
++		errCheck func(t *testing.T, err error)
++	}{
++		"context cancelled": {
++			ctx: func() context.Context {
++				ctx, cancel := context.WithCancel(context.Background())
++				cancel()
++				return ctx
++			}(),
++			ref:     esv1.ExternalSecretDataRemoteRef{Key: "example"},
++			fake:    &fakeVaultClient{},
++			wantErr: context.Canceled,
++		},
++		"get secret returns error": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretDataRemoteRef{
++				Key: "example",
++			},
++			fake: &fakeVaultClient{
++				getSecretFn: func(secretName string) (*vault.Secret, error) {
++					return nil, ErrNotImplemented
++				},
++			},
++			wantErr: ErrNotImplemented,
++		},
++		"secret data missing": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretDataRemoteRef{
++				Key: "example",
++			},
++			fake: &fakeVaultClient{
++				getSecretFn: func(secretName string) (*vault.Secret, error) {
++					return &vault.Secret{}, nil
++				},
++			},
++			wantErr: ErrSecretDataMissing,
++		},
++		"returns all top-level keys when property is empty": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretDataRemoteRef{
++				Key: "example",
++			},
++			fake: &fakeVaultClient{
++				getSecretFn: func(secretName string) (*vault.Secret, error) {
++					data := map[string]interface{}{
++						"username": "alice",
++						"enabled":  true,
++						"count":    float64(3),
++					}
++					return &vault.Secret{
++						SecretRequest: vault.SecretRequest{
++							Data: &data,
++						},
++					}, nil
++				},
++			},
++			want: map[string][]byte{
++				"username": []byte("alice"),
++				"enabled":  []byte("true"),
++				"count":    []byte("3"),
++			},
++		},
++		"returns nested object fields when property points to object": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretDataRemoteRef{
++				Key:      "example",
++				Property: "db",
++			},
++			fake: &fakeVaultClient{
++				getSecretFn: func(secretName string) (*vault.Secret, error) {
++					data := map[string]interface{}{
++						"db": map[string]interface{}{
++							"user": "alice",
++							"port": float64(5432),
++						},
++					}
++					return &vault.Secret{
++						SecretRequest: vault.SecretRequest{
++							Data: &data,
++						},
++					}, nil
++				},
++			},
++			want: map[string][]byte{
++				"user": []byte("alice"),
++				"port": []byte("5432"),
++			},
++		},
++		"returns single key value when property points to scalar": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretDataRemoteRef{
++				Key:      "example",
++				Property: "username",
++			},
++			fake: &fakeVaultClient{
++				getSecretFn: func(secretName string) (*vault.Secret, error) {
++					data := map[string]interface{}{
++						"username": "alice",
++						"enabled":  true,
++					}
++					return &vault.Secret{
++						SecretRequest: vault.SecretRequest{
++							Data: &data,
++						},
++					}, nil
++				},
++			},
++			want: map[string][]byte{
++				"username": []byte("alice"),
++			},
++		},
++		"property not found": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretDataRemoteRef{
++				Key:      "example",
++				Property: "missing",
++			},
++			fake: &fakeVaultClient{
++				getSecretFn: func(secretName string) (*vault.Secret, error) {
++					data := map[string]interface{}{
++						"username": "alice",
++					}
++					return &vault.Secret{
++						SecretRequest: vault.SecretRequest{
++							Data: &data,
++						},
++					}, nil
++				},
++			},
++			wantErr: ErrPropertyNotFound,
++		},
++		"property is nil": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretDataRemoteRef{
++				Key:      "example",
++				Property: "username",
++			},
++			fake: &fakeVaultClient{
++				getSecretFn: func(secretName string) (*vault.Secret, error) {
++					data := map[string]interface{}{
++						"username": nil,
++					}
++					return &vault.Secret{
++						SecretRequest: vault.SecretRequest{
++							Data: &data,
++						},
++					}, nil
++				},
++			},
++			wantErr: ErrPropertyNotFound,
++		},
++		"top-level value conversion error": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretDataRemoteRef{
++				Key: "example",
++			},
++			fake: &fakeVaultClient{
++				getSecretFn: func(secretName string) (*vault.Secret, error) {
++					data := map[string]interface{}{
++						"broken": make(chan int),
++					}
++					return &vault.Secret{
++						SecretRequest: vault.SecretRequest{
++							Data: &data,
++						},
++					}, nil
++				},
++			},
++			errCheck: func(t *testing.T, err error) {
++				require.Error(t, err)
++				assert.Contains(t, err.Error(), "unsupported type")
++			},
++		},
++		"nested value conversion error": {
++			ctx: context.Background(),
++			ref: esv1.ExternalSecretDataRemoteRef{
++				Key:      "example",
++				Property: "db",
++			},
++			fake: &fakeVaultClient{
++				getSecretFn: func(secretName string) (*vault.Secret, error) {
++					data := map[string]interface{}{
++						"db": map[string]interface{}{
++							"broken": make(chan int),
++						},
++					}
++					return &vault.Secret{
++						SecretRequest: vault.SecretRequest{
++							Data: &data,
++						},
++					}, nil
++				},
++			},
++			errCheck: func(t *testing.T, err error) {
++				require.Error(t, err)
++				assert.Contains(t, err.Error(), "unsupported type")
++			},
++		},
++	}
++
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			c := &SecretsClient{
++				vault: tc.fake,
++			}
++
++			got, err := c.GetSecretMap(tc.ctx, tc.ref)
++
++			if tc.errCheck != nil {
++				tc.errCheck(t, err)
++				return
++			}
++
++			if tc.wantErr != nil {
++				require.Error(t, err)
++				assert.ErrorIs(t, err, tc.wantErr)
++				return
++			}
++
++			require.NoError(t, err)
++			require.Len(t, got, len(tc.want))
++			assert.Equal(t, tc.want, got)
++		})
++	}
++}
++
++func TestAnyToBytes(t *testing.T) {
++	tests := map[string]struct {
++		input   any
++		want    []byte
++		wantErr bool
++	}{
++		"bytes": {
++			input: []byte("hello"),
++			want:  []byte("hello"),
++		},
++		"string": {
++			input: "hello",
++			want:  []byte("hello"),
++		},
++		"bool true": {
++			input: true,
++			want:  []byte("true"),
++		},
++		"bool false": {
++			input: false,
++			want:  []byte("false"),
++		},
++		"float64 integer value": {
++			input: 42.0,
++			want:  []byte("42"),
++		},
++		"float64 decimal value": {
++			input: 3.14,
++			want:  []byte("3.14"),
++		},
++		"json number integer": {
++			input: json.Number("123"),
++			want:  []byte("123"),
++		},
++		"json number decimal": {
++			input: json.Number("45.67"),
++			want:  []byte("45.67"),
++		},
++		"map marshaled as json": {
++			input: map[string]any{
++				"user": "alice",
++				"ok":   true,
++			},
++			want: []byte(`{"ok":true,"user":"alice"}`),
++		},
++		"slice marshaled as json": {
++			input: []any{"a", 1.0, true},
++			want:  []byte(`["a",1,true]`),
++		},
++		"nil marshaled as json null": {
++			input: nil,
++			want:  []byte("null"),
++		},
++		"unsupported marshal type returns error": {
++			input:   make(chan int),
++			wantErr: true,
++		},
++	}
++
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			got, err := anyToBytes(tc.input)
++
++			if tc.wantErr {
++				require.Error(t, err)
++				return
++			}
++
++			require.NoError(t, err)
++
++			if len(tc.want) > 0 && (tc.want[0] == '{' || tc.want[0] == '[') {
++				assert.JSONEq(t, string(tc.want), string(got))
++				return
++			}
++
++			assert.Equal(t, tc.want, got)
++		})
++	}
++}
+diff --git a/providers/v1/privx/fake_client_test.go b/providers/v1/privx/fake_client_test.go
+new file mode 100644
+index 00000000..97b4d0df
+--- /dev/null
++++ b/providers/v1/privx/fake_client_test.go
+@@ -0,0 +1,92 @@
++/*
++Copyright © 2026 SSH Communications
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package privx
++
++import (
++	"context"
++
++	corev1 "k8s.io/api/core/v1"
++
++	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
++)
++
++type fakeSecretsClient struct {
++	getSecretFn     func(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) ([]byte, error)
++	pushSecretFn    func(ctx context.Context, secret *corev1.Secret, data esv1.PushSecretData) error
++	deleteSecretFn  func(ctx context.Context, ref esv1.PushSecretRemoteRef) error
++	secretExistsFn  func(ctx context.Context, ref esv1.PushSecretRemoteRef) (bool, error)
++	validateFn      func() (esv1.ValidationResult, error)
++	getSecretMapFn  func(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) (map[string][]byte, error)
++	getAllSecretsFn func(ctx context.Context, ref esv1.ExternalSecretFind) (map[string][]byte, error)
++	closeFn         func(ctx context.Context) error
++}
++
++func (f *fakeSecretsClient) GetSecret(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) ([]byte, error) {
++	if f.getSecretFn != nil {
++		return f.getSecretFn(ctx, ref)
++	}
++	return nil, nil
++}
++
++func (f *fakeSecretsClient) PushSecret(ctx context.Context, secret *corev1.Secret, data esv1.PushSecretData) error {
++	if f.pushSecretFn != nil {
++		return f.pushSecretFn(ctx, secret, data)
++	}
++	return nil
++}
++
++func (f *fakeSecretsClient) DeleteSecret(ctx context.Context, ref esv1.PushSecretRemoteRef) error {
++	if f.deleteSecretFn != nil {
++		return f.deleteSecretFn(ctx, ref)
++	}
++	return nil
++}
++
++func (f *fakeSecretsClient) SecretExists(ctx context.Context, ref esv1.PushSecretRemoteRef) (bool, error) {
++	if f.secretExistsFn != nil {
++		return f.secretExistsFn(ctx, ref)
++	}
++	return false, nil
++}
++
++func (f *fakeSecretsClient) Validate() (esv1.ValidationResult, error) {
++	if f.validateFn != nil {
++		return f.validateFn()
++	}
++	return esv1.ValidationResultUnknown, nil
++}
++
++func (f *fakeSecretsClient) GetSecretMap(ctx context.Context, ref esv1.ExternalSecretDataRemoteRef) (map[string][]byte, error) {
++	if f.getSecretMapFn != nil {
++		return f.getSecretMapFn(ctx, ref)
++	}
++	return nil, nil
++}
++
++func (f *fakeSecretsClient) GetAllSecrets(ctx context.Context, ref esv1.ExternalSecretFind) (map[string][]byte, error) {
++	if f.getAllSecretsFn != nil {
++		return f.getAllSecretsFn(ctx, ref)
++	}
++	return nil, nil
++}
++
++func (f *fakeSecretsClient) Close(ctx context.Context) error {
++	if f.closeFn != nil {
++		return f.closeFn(ctx)
++	}
++	return nil
++}
+diff --git a/providers/v1/privx/fake_vault_client_test.go b/providers/v1/privx/fake_vault_client_test.go
+new file mode 100644
+index 00000000..7e091316
+--- /dev/null
++++ b/providers/v1/privx/fake_vault_client_test.go
+@@ -0,0 +1,164 @@
++/*
++Copyright © 2026 SSH Communications
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package privx
++
++import (
++	"encoding/json"
++
++	"github.com/SSHcom/privx-sdk-go/v2/api/filters"
++	"github.com/SSHcom/privx-sdk-go/v2/api/response"
++	"github.com/SSHcom/privx-sdk-go/v2/api/vault"
++)
++
++// fakeVaultClient is a test double for VaultClient.
++type fakeVaultClient struct {
++	statusFn                  func() (*response.ServiceStatus, error)
++	getSecretsMetadataFn      func(name string) (*vault.Secret, error)
++	getUsersSecretsMetadataFn func(userID, name string) (*vault.Secret, error)
++	getUserSecretsFn          func(userID string, opts ...filters.Option) (*response.ResultSet[vault.Secret], error)
++	createUserSecretFn        func(userID string, secret *vault.SecretRequest) (vault.SecretCreate, error)
++	getUserSecretFn           func(userID, secretName string) (*vault.Secret, error)
++	updateUserSecretFn        func(userID, secretName string, secret *vault.SecretRequest) error
++	deleteUserSecretFn        func(userID, secretName string) error
++	getSchemasFn              func() (*json.RawMessage, error)
++	getSecretsFn              func(opts ...filters.Option) (*response.ResultSet[vault.Secret], error)
++	createSecretFn            func(secret *vault.SecretRequest) (vault.SecretCreate, error)
++	getSecretFn               func(secretName string) (*vault.Secret, error)
++	updateSecretFn            func(secretName string, secret *vault.SecretRequest) error
++	deleteSecretFn            func(secretName string) error
++	searchSecretsFn           func(search vault.SecretSearch, opts ...filters.Option) (*response.ResultSet[vault.Secret], error)
++}
++
++// Status returns the configured fake result for Status.
++func (f *fakeVaultClient) Status() (*response.ServiceStatus, error) {
++	if f.statusFn != nil {
++		return f.statusFn()
++	}
++	return nil, nil
++}
++
++// GetSecretsMetadata returns the configured fake result for GetSecretsMetadata.
++func (f *fakeVaultClient) GetSecretsMetadata(name string) (*vault.Secret, error) {
++	if f.getSecretsMetadataFn != nil {
++		return f.getSecretsMetadataFn(name)
++	}
++	return nil, nil
++}
++
++// GetUsersSecretsMetadata returns the configured fake result for GetUsersSecretsMetadata.
++func (f *fakeVaultClient) GetUsersSecretsMetadata(userID, name string) (*vault.Secret, error) {
++	if f.getUsersSecretsMetadataFn != nil {
++		return f.getUsersSecretsMetadataFn(userID, name)
++	}
++	return nil, nil
++}
++
++// GetUserSecrets returns the configured fake result for GetUserSecrets.
++func (f *fakeVaultClient) GetUserSecrets(userID string, opts ...filters.Option) (*response.ResultSet[vault.Secret], error) {
++	if f.getUserSecretsFn != nil {
++		return f.getUserSecretsFn(userID, opts...)
++	}
++	return nil, nil
++}
++
++// CreateUserSecret returns the configured fake result for CreateUserSecret.
++func (f *fakeVaultClient) CreateUserSecret(userID string, secret *vault.SecretRequest) (vault.SecretCreate, error) {
++	if f.createUserSecretFn != nil {
++		return f.createUserSecretFn(userID, secret)
++	}
++	return vault.SecretCreate{}, nil
++}
++
++// GetUserSecret returns the configured fake result for GetUserSecret.
++func (f *fakeVaultClient) GetUserSecret(userID, secretName string) (*vault.Secret, error) {
++	if f.getUserSecretFn != nil {
++		return f.getUserSecretFn(userID, secretName)
++	}
++	return nil, nil
++}
++
++// UpdateUserSecret returns the configured fake result for UpdateUserSecret.
++func (f *fakeVaultClient) UpdateUserSecret(userID, secretName string, secret *vault.SecretRequest) error {
++	if f.updateUserSecretFn != nil {
++		return f.updateUserSecretFn(userID, secretName, secret)
++	}
++	return nil
++}
++
++// DeleteUserSecret returns the configured fake result for DeleteUserSecret.
++func (f *fakeVaultClient) DeleteUserSecret(userID, secretName string) error {
++	if f.deleteUserSecretFn != nil {
++		return f.deleteUserSecretFn(userID, secretName)
++	}
++	return nil
++}
++
++// GetSchemas returns the configured fake result for GetSchemas.
++func (f *fakeVaultClient) GetSchemas() (*json.RawMessage, error) {
++	if f.getSchemasFn != nil {
++		return f.getSchemasFn()
++	}
++	return nil, nil
++}
++
++// GetSecrets returns the configured fake result for GetSecrets.
++func (f *fakeVaultClient) GetSecrets(opts ...filters.Option) (*response.ResultSet[vault.Secret], error) {
++	if f.getSecretsFn != nil {
++		return f.getSecretsFn(opts...)
++	}
++	return nil, nil
++}
++
++// CreateSecret returns the configured fake result for CreateSecret.
++func (f *fakeVaultClient) CreateSecret(secret *vault.SecretRequest) (vault.SecretCreate, error) {
++	if f.createSecretFn != nil {
++		return f.createSecretFn(secret)
++	}
++	return vault.SecretCreate{}, nil
++}
++
++// GetSecret returns the configured fake result for GetSecret.
++func (f *fakeVaultClient) GetSecret(secretName string) (*vault.Secret, error) {
++	if f.getSecretFn != nil {
++		return f.getSecretFn(secretName)
++	}
++	return nil, nil
++}
++
++// UpdateSecret returns the configured fake result for UpdateSecret.
++func (f *fakeVaultClient) UpdateSecret(secretName string, secret *vault.SecretRequest) error {
++	if f.updateSecretFn != nil {
++		return f.updateSecretFn(secretName, secret)
++	}
++	return nil
++}
++
++// DeleteSecret returns the configured fake result for DeleteSecret.
++func (f *fakeVaultClient) DeleteSecret(secretName string) error {
++	if f.deleteSecretFn != nil {
++		return f.deleteSecretFn(secretName)
++	}
++	return nil
++}
++
++// SearchSecrets returns the configured fake result for SearchSecrets.
++func (f *fakeVaultClient) SearchSecrets(search vault.SecretSearch, opts ...filters.Option) (*response.ResultSet[vault.Secret], error) {
++	if f.searchSecretsFn != nil {
++		return f.searchSecretsFn(search, opts...)
++	}
++	return nil, nil
++}
+diff --git a/providers/v1/privx/jwt_test.go b/providers/v1/privx/jwt_test.go
+new file mode 100644
+index 00000000..aaf244f2
+--- /dev/null
++++ b/providers/v1/privx/jwt_test.go
+@@ -0,0 +1,416 @@
++/*
++Copyright © 2026 SSH Communications
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package privx
++
++import (
++	"context"
++	"crypto/ed25519"
++	"crypto/rand"
++	"crypto/rsa"
++	"crypto/x509"
++	"encoding/base64"
++	"encoding/json"
++	"encoding/pem"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	jwt "github.com/golang-jwt/jwt/v5"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestGetServiceAccountNameFromJWT(t *testing.T) {
++	makeJWT := func(payload map[string]any) string {
++		header := `{"alg":"none","typ":"JWT"}`
++		h := base64.RawURLEncoding.EncodeToString([]byte(header))
++
++		pb, _ := json.Marshal(payload)
++		p := base64.RawURLEncoding.EncodeToString(pb)
++
++		// signature part can be empty for these tests
++		return h + "." + p + "."
++	}
++
++	tests := map[string]struct {
++		token   string
++		want    string
++		wantErr error
++	}{
++		"claim kubernetes service account name": {
++			token: makeJWT(map[string]any{
++				"kubernetes.io/serviceaccount/service-account.name": "my-sa",
++			}),
++			want: "my-sa",
++		},
++		"fallback to sub claim": {
++			token: makeJWT(map[string]any{
++				"sub": "system:serviceaccount:default:my-sa",
++			}),
++			want: "my-sa",
++		},
++		"invalid format": {
++			token:   "invalid-token",
++			wantErr: ErrInvalidJWTFormat,
++		},
++		"invalid base64 payload": {
++			token:   "a.b!.c",
++			wantErr: ErrDecodeJWTPayload,
++		},
++		"invalid json payload": {
++			token: func() string {
++				header := base64.RawURLEncoding.EncodeToString([]byte(`{}`))
++				payload := base64.RawURLEncoding.EncodeToString([]byte(`{invalid json`))
++				return header + "." + payload + "."
++			}(),
++			wantErr: ErrParseJWTPayload,
++		},
++		"missing service account": {
++			token: makeJWT(map[string]any{
++				"iss": "something",
++			}),
++			wantErr: ErrServiceAccountNameNotFound,
++		},
++		"sub malformed": {
++			token: makeJWT(map[string]any{
++				"sub": "system:serviceaccount:default",
++			}),
++			wantErr: ErrServiceAccountNameNotFound,
++		},
++	}
++
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			got, err := getServiceAccountNameFromJWT(tc.token)
++
++			if tc.wantErr != nil {
++				require.Error(t, err)
++				assert.ErrorIs(t, err, tc.wantErr)
++				return
++			}
++
++			require.NoError(t, err)
++			assert.Equal(t, tc.want, got)
++		})
++	}
++}
++
++func TestDecodeJWT(t *testing.T) {
++	makeJWT := func(header string, payload string) string {
++		h := base64.RawURLEncoding.EncodeToString([]byte(header))
++		p := base64.RawURLEncoding.EncodeToString([]byte(payload))
++		return h + "." + p + "."
++	}
++
++	tests := map[string]struct {
++		token    string
++		wantText []string
++		wantErr  string
++	}{
++		"valid jwt": {
++			token: makeJWT(
++				`{"alg":"RS256","typ":"JWT"}`,
++				`{"sub":"system:serviceaccount:default:my-sa","aud":"privx"}`,
++			),
++			wantText: []string{
++				"HEADER:",
++				`"alg": "RS256"`,
++				`"typ": "JWT"`,
++				"PAYLOAD:",
++				`"sub": "system:serviceaccount:default:my-sa"`,
++				`"aud": "privx"`,
++			},
++		},
++		"invalid format": {
++			token:   "not-a-jwt",
++			wantErr: "invalid JWT format",
++		},
++		"invalid header base64": {
++			token:   "%%%." + base64.RawURLEncoding.EncodeToString([]byte(`{}`)) + ".",
++			wantErr: "decode header",
++		},
++		"invalid header json": {
++			token: makeJWT(
++				`{invalid json`,
++				`{"sub":"x"}`,
++			),
++			wantErr: "unmarshal header",
++		},
++		"invalid payload base64": {
++			token:   base64.RawURLEncoding.EncodeToString([]byte(`{}`)) + ".%%%.",
++			wantErr: "decode payload",
++		},
++		"invalid payload json": {
++			token: makeJWT(
++				`{"alg":"RS256"}`,
++				`{invalid json`,
++			),
++			wantErr: "unmarshal payload",
++		},
++	}
++
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			got, err := decodeJWT(tc.token)
++
++			if tc.wantErr != "" {
++				require.Error(t, err)
++				assert.Contains(t, err.Error(), tc.wantErr)
++				return
++			}
++
++			require.NoError(t, err)
++			for _, s := range tc.wantText {
++				assert.Contains(t, got, s)
++			}
++		})
++	}
++}
++
++func TestDetectJWTSigningKey(t *testing.T) {
++	makeRSAPKCS1PEM := func(t *testing.T) []byte {
++		t.Helper()
++
++		key, err := rsa.GenerateKey(rand.Reader, 2048)
++		require.NoError(t, err)
++
++		block := &pem.Block{
++			Type:  "RSA PRIVATE KEY",
++			Bytes: x509.MarshalPKCS1PrivateKey(key),
++		}
++
++		return pem.EncodeToMemory(block)
++	}
++
++	makeRSAPKCS8PEM := func(t *testing.T) []byte {
++		t.Helper()
++
++		key, err := rsa.GenerateKey(rand.Reader, 2048)
++		require.NoError(t, err)
++
++		der, err := x509.MarshalPKCS8PrivateKey(key)
++		require.NoError(t, err)
++
++		block := &pem.Block{
++			Type:  "PRIVATE KEY",
++			Bytes: der,
++		}
++
++		return pem.EncodeToMemory(block)
++	}
++
++	makeEd25519PKCS8PEM := func(t *testing.T) []byte {
++		t.Helper()
++
++		_, key, err := ed25519.GenerateKey(rand.Reader)
++		require.NoError(t, err)
++
++		der, err := x509.MarshalPKCS8PrivateKey(key)
++		require.NoError(t, err)
++
++		block := &pem.Block{
++			Type:  "PRIVATE KEY",
++			Bytes: der,
++		}
++
++		return pem.EncodeToMemory(block)
++	}
++
++	tests := map[string]struct {
++		pemBytes        []byte
++		wantErr         error
++		wantMethod      jwt.SigningMethod
++		assertKeyTypeFn func(t *testing.T, key any)
++	}{
++		"invalid pem block": {
++			pemBytes: []byte("not a pem"),
++			wantErr:  ErrInvalidPEMBlock,
++		},
++		"unsupported pem block type": {
++			pemBytes: pem.EncodeToMemory(&pem.Block{
++				Type:  "CERTIFICATE",
++				Bytes: []byte("dummy"),
++			}),
++			wantErr: ErrUnsupportedPEMBlockType,
++		},
++		"rsa pkcs1": {
++			pemBytes:   makeRSAPKCS1PEM(t),
++			wantMethod: jwt.SigningMethodRS256,
++			assertKeyTypeFn: func(t *testing.T, key any) {
++				t.Helper()
++				_, ok := key.(*rsa.PrivateKey)
++				assert.True(t, ok)
++			},
++		},
++		"rsa pkcs8": {
++			pemBytes:   makeRSAPKCS8PEM(t),
++			wantMethod: jwt.SigningMethodRS256,
++			assertKeyTypeFn: func(t *testing.T, key any) {
++				t.Helper()
++				_, ok := key.(*rsa.PrivateKey)
++				assert.True(t, ok)
++			},
++		},
++		"ed25519 pkcs8": {
++			pemBytes:   makeEd25519PKCS8PEM(t),
++			wantMethod: jwt.SigningMethodEdDSA,
++			assertKeyTypeFn: func(t *testing.T, key any) {
++				t.Helper()
++				_, ok := key.(ed25519.PrivateKey)
++				assert.True(t, ok)
++			},
++		},
++	}
++
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			gotMethod, gotKey, err := detectJWTSigningKey(tc.pemBytes)
++
++			if tc.wantErr != nil {
++				require.Error(t, err)
++				assert.ErrorIs(t, err, tc.wantErr)
++				assert.Nil(t, gotMethod)
++				assert.Nil(t, gotKey)
++				return
++			}
++
++			require.NoError(t, err)
++			assert.Equal(t, tc.wantMethod, gotMethod)
++			require.NotNil(t, gotKey)
++
++			if tc.assertKeyTypeFn != nil {
++				tc.assertKeyTypeFn(t, gotKey)
++			}
++		})
++	}
++}
++
++func TestExchangeToken(t *testing.T) {
++	tests := map[string]struct {
++		reqBody   ExchangeTokenRequest
++		server    func(t *testing.T) *httptest.Server
++		client    *http.Client
++		want      TokenResponse
++		wantErr   error
++		errSubstr string
++	}{
++		"empty token": {
++			reqBody: ExchangeTokenRequest{},
++			wantErr: ErrTokenEmpty,
++		},
++		"successful response": {
++			reqBody: ExchangeTokenRequest{
++				Token: "jwt-token",
++			},
++			server: func(t *testing.T) *httptest.Server {
++				return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++					require.Equal(t, "/auth/api/v1/token/login", r.URL.Path)
++					require.Equal(t, "application/json", r.Header.Get("Content-Type"))
++
++					w.WriteHeader(200)
++					_, _ = w.Write([]byte(`{
++						"access_token":"abc123",
++						"token_type":"Bearer",
++						"expires_in":3600
++					}`))
++				}))
++			},
++			want: TokenResponse{
++				AccessToken: "abc123",
++				TokenType:   "Bearer",
++				ExpiresIn:   3600,
++			},
++		},
++		"bad status code": {
++			reqBody: ExchangeTokenRequest{
++				Token: "jwt-token",
++			},
++			server: func(t *testing.T) *httptest.Server {
++				return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++					w.WriteHeader(400)
++					_, _ = w.Write([]byte("bad request"))
++				}))
++			},
++			wantErr: ErrPrivXTokenExchangeBadStatus,
++		},
++		"invalid json response": {
++			reqBody: ExchangeTokenRequest{
++				Token: "jwt-token",
++			},
++			server: func(t *testing.T) *httptest.Server {
++				return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++					w.WriteHeader(200)
++					_, _ = w.Write([]byte(`{invalid json`))
++				}))
++			},
++			errSubstr: "decode json",
++		},
++		"http client error": {
++			reqBody: ExchangeTokenRequest{
++				Token: "jwt-token",
++			},
++			client: &http.Client{
++				Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
++					return nil, errors.New("network error")
++				}),
++			},
++			errSubstr: "do request",
++		},
++	}
++
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			var baseURL string
++			if tc.server != nil {
++				srv := tc.server(t)
++				defer srv.Close()
++				baseURL = srv.URL
++			} else {
++				baseURL = "http://example.com"
++			}
++
++			client := tc.client
++			if client == nil {
++				client = &http.Client{}
++			}
++
++			got, err := ExchangeToken(context.Background(), client, baseURL, tc.reqBody)
++
++			if tc.wantErr != nil {
++				require.Error(t, err)
++				assert.ErrorIs(t, err, tc.wantErr)
++				return
++			}
++
++			if tc.errSubstr != "" {
++				require.Error(t, err)
++				assert.Contains(t, err.Error(), tc.errSubstr)
++				return
++			}
++
++			require.NoError(t, err)
++			assert.Equal(t, tc.want, got)
++		})
++	}
++}
++
++type roundTripFunc func(*http.Request) (*http.Response, error)
++
++func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
++	return f(r)
++}
+diff --git a/providers/v1/privx/provider.go b/providers/v1/privx/provider.go
+index ca6a5bef..2233f4bf 100644
+--- a/providers/v1/privx/provider.go
++++ b/providers/v1/privx/provider.go
+@@ -93,6 +93,14 @@ var _ esv1.Provider = (*Provider)(nil)
+ 
+ // Provider implements the ESO Provider interface for PrivX.
+ type Provider struct {
++	// newClient is the function that actually returns a new client.
++	// Tests can replace this function to create a fake client.
++	newClient func(
++		ctx context.Context,
++		store esv1.GenericStore,
++		kube kclient.Client,
++		namespace string,
++	) (esv1.SecretsClient, error)
+ }
+ 
+ // readSecretValue gets a Kubernetes Secret as a string.
+@@ -263,6 +271,20 @@ func (p *Provider) NewClient(
+ 	kube kclient.Client,
+ 	namespace string,
+ ) (esv1.SecretsClient, error) {
++	if p.newClient == nil {
++		return newRealClient(ctx, store, kube, namespace)
++	}
++	return p.newClient(ctx, store, kube, namespace)
++}
++
++// newRealClient returns a new PrivX Client.
++func newRealClient(
++	ctx context.Context,
++	store esv1.GenericStore,
++	kube kclient.Client,
++	namespace string,
++) (esv1.SecretsClient, error) {
++
+ 	config := store.GetSpec().Provider.PrivX
+ 	conn, err := privxAPI(ctx, kube, namespace, config)
+ 	if err != nil {
+@@ -270,8 +292,10 @@ func (p *Provider) NewClient(
+ 	}
+ 
+ 	client := SecretsClient{
+-		conn:              conn,
+-		vault:             vault.New(conn),
++		conn: conn,
++		vault: &sdkVaultClient{
++			v: vault.New(conn),
++		},
+ 		store:             store,
+ 		kube:              kube,
+ 		namespace:         namespace,
+@@ -312,7 +336,9 @@ func (p *Provider) Capabilities() esv1.SecretStoreCapabilities {
+ 
+ // NewProvider creates a new Provider instance.
+ func NewProvider() esv1.Provider {
+-	return &Provider{}
++	return &Provider{
++		newClient: newRealClient,
++	}
+ }
+ 
+ // ProviderSpec returns the provider specification for registration.
+diff --git a/providers/v1/privx/provider_test.go b/providers/v1/privx/provider_test.go
+new file mode 100644
+index 00000000..4351c173
+--- /dev/null
++++ b/providers/v1/privx/provider_test.go
+@@ -0,0 +1,181 @@
++/*
++Copyright © 2026 SSH Communications
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package privx
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	kclient "sigs.k8s.io/controller-runtime/pkg/client"
++
++	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
++)
++
++var ErrFakeNewClient = errors.New("fake new client error")
++
++func TestProviderNewClient(t *testing.T) {
++	tests := map[string]struct {
++		namespace string
++		store     esv1.SecretStore
++		wantErr   error
++	}{
++		"ok": {
++			namespace: "default",
++			store: esv1.SecretStore{
++				Spec: esv1.SecretStoreSpec{
++					Provider: &esv1.SecretStoreProvider{
++						PrivX: &esv1.PrivxProvider{
++							Host: "https://privx.example.com",
++						},
++					},
++				},
++			},
++			wantErr: nil,
++		},
++		"factory returns error": {
++			namespace: "default",
++			store: esv1.SecretStore{
++				Spec: esv1.SecretStoreSpec{
++					Provider: &esv1.SecretStoreProvider{
++						PrivX: &esv1.PrivxProvider{
++							Host: "https://privx.example.com",
++						},
++					},
++				},
++			},
++			wantErr: ErrFakeNewClient,
++		},
++	}
++
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			var gotNamespace string
++			var gotStore esv1.GenericStore
++
++			p := &Provider{
++				newClient: func(
++					ctx context.Context,
++					store esv1.GenericStore,
++					kube kclient.Client,
++					namespace string,
++				) (esv1.SecretsClient, error) {
++					gotNamespace = namespace
++					gotStore = store
++
++					if name == "factory returns error" {
++						return nil, ErrFakeNewClient
++					}
++
++					return &fakeSecretsClient{}, nil
++				},
++			}
++
++			client, err := p.NewClient(
++				context.Background(),
++				&tc.store,
++				nil,
++				tc.namespace,
++			)
++
++			if tc.wantErr != nil {
++				require.Error(t, err)
++				assert.ErrorIs(t, err, tc.wantErr)
++				assert.Nil(t, client)
++				return
++			}
++
++			require.NoError(t, err)
++			require.NotNil(t, client)
++			assert.IsType(t, &fakeSecretsClient{}, client)
++			assert.Equal(t, tc.namespace, gotNamespace)
++			assert.Equal(t, &tc.store, gotStore)
++		})
++	}
++}
++
++func TestMaintenanceStatus(t *testing.T) {
++	got := MaintenanceStatus()
++	assert.Equal(t, esv1.MaintenanceStatusMaintained, got)
++}
++
++func TestProviderCapabilities(t *testing.T) {
++	p := &Provider{}
++
++	got := p.Capabilities()
++
++	assert.Equal(t, esv1.SecretStoreReadWrite, got)
++}
++
++func TestProviderValidateStore(t *testing.T) {
++	tests := map[string]struct {
++		store   esv1.SecretStore
++		wantErr error
++	}{
++		"missing provider": {
++			store: esv1.SecretStore{
++				Spec: esv1.SecretStoreSpec{
++					Provider: nil,
++				},
++			},
++			wantErr: ErrNoStoreAuth{Field: "spec.provider"},
++		},
++		"missing privx provider": {
++			store: esv1.SecretStore{
++				Spec: esv1.SecretStoreSpec{
++					Provider: &esv1.SecretStoreProvider{},
++				},
++			},
++			wantErr: ErrNoStoreAuth{Field: "spec.provider.privx"},
++		},
++		"missing host": {
++			store: esv1.SecretStore{
++				Spec: esv1.SecretStoreSpec{
++					Provider: &esv1.SecretStoreProvider{
++						PrivX: &esv1.PrivxProvider{},
++					},
++				},
++			},
++			wantErr: ErrNoStoreAuth{Field: "spec.provider.privx.host"},
++		},
++		"valid store": {
++			store: esv1.SecretStore{
++				Spec: esv1.SecretStoreSpec{
++					Provider: &esv1.SecretStoreProvider{
++						PrivX: &esv1.PrivxProvider{
++							Host: "https://privx.example.com",
++						},
++					},
++				},
++			},
++			wantErr: nil,
++		},
++	}
++
++	p := &Provider{}
++
++	for name, tc := range tests {
++		t.Run(name, func(t *testing.T) {
++			gotWarnings, gotErr := p.ValidateStore(&tc.store)
++
++			assert.Nil(t, gotWarnings)
++			assert.Equal(t, tc.wantErr, gotErr)
++		})
++	}
++}
+diff --git a/providers/v1/privx/vault_client.go b/providers/v1/privx/vault_client.go
+new file mode 100644
+index 00000000..d744de58
+--- /dev/null
++++ b/providers/v1/privx/vault_client.go
+@@ -0,0 +1,128 @@
++/*
++Copyright © 2026 SSH Communications
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++	https://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++	WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package privx
++
++import (
++	"encoding/json"
++
++	"github.com/SSHcom/privx-sdk-go/v2/api/filters"
++	"github.com/SSHcom/privx-sdk-go/v2/api/response"
++	"github.com/SSHcom/privx-sdk-go/v2/api/vault"
++)
++
++// VaultClient defines an interface to PrivX Vault.
++type VaultClient interface {
++	Status() (*response.ServiceStatus, error)
++
++	GetSecretsMetadata(name string) (*vault.Secret, error)
++	GetUsersSecretsMetadata(userID, name string) (*vault.Secret, error)
++
++	GetUserSecrets(userID string, opts ...filters.Option) (*response.ResultSet[vault.Secret], error)
++	CreateUserSecret(userID string, secret *vault.SecretRequest) (vault.SecretCreate, error)
++	GetUserSecret(userID, secretName string) (*vault.Secret, error)
++	UpdateUserSecret(userID, secretName string, secret *vault.SecretRequest) error
++	DeleteUserSecret(userID, secretName string) error
++
++	GetSchemas() (*json.RawMessage, error)
++
++	GetSecrets(opts ...filters.Option) (*response.ResultSet[vault.Secret], error)
++	CreateSecret(secret *vault.SecretRequest) (vault.SecretCreate, error)
++	GetSecret(secretName string) (*vault.Secret, error)
++	UpdateSecret(secretName string, secret *vault.SecretRequest) error
++	DeleteSecret(secretName string) error
++	SearchSecrets(search vault.SecretSearch, opts ...filters.Option) (*response.ResultSet[vault.Secret], error)
++}
++
++// sdkVaultClient is an adapter over the PrivX SDK vault client.
++type sdkVaultClient struct {
++	v *vault.Vault
++}
++
++// Status returns vault service status.
++func (c *sdkVaultClient) Status() (*response.ServiceStatus, error) {
++	return c.v.Status()
++}
++
++// GetSecretsMetadata returns metadata for a secret.
++func (c *sdkVaultClient) GetSecretsMetadata(name string) (*vault.Secret, error) {
++	return c.v.GetSecretsMetadata(name)
++}
++
++// GetUsersSecretsMetadata returns user secret metadata.
++func (c *sdkVaultClient) GetUsersSecretsMetadata(userID, name string) (*vault.Secret, error) {
++	return c.v.GetUsersSecretsMetadata(userID, name)
++}
++
++// GetUserSecrets returns user secrets.
++func (c *sdkVaultClient) GetUserSecrets(userID string, opts ...filters.Option) (*response.ResultSet[vault.Secret], error) {
++	return c.v.GetUserSecrets(userID, opts...)
++}
++
++// CreateUserSecret creates a user secret.
++func (c *sdkVaultClient) CreateUserSecret(userID string, secret *vault.SecretRequest) (vault.SecretCreate, error) {
++	return c.v.CreateUserSecret(userID, secret)
++}
++
++// GetUserSecret returns a user secret by name.
++func (c *sdkVaultClient) GetUserSecret(userID, secretName string) (*vault.Secret, error) {
++	return c.v.GetUserSecret(userID, secretName)
++}
++
++// UpdateUserSecret updates a user secret.
++func (c *sdkVaultClient) UpdateUserSecret(userID, secretName string, secret *vault.SecretRequest) error {
++	return c.v.UpdateUserSecret(userID, secretName, secret)
++}
++
++// DeleteUserSecret deletes a user secret.
++func (c *sdkVaultClient) DeleteUserSecret(userID, secretName string) error {
++	return c.v.DeleteUserSecret(userID, secretName)
++}
++
++// GetSchemas returns vault schemas.
++func (c *sdkVaultClient) GetSchemas() (*json.RawMessage, error) {
++	return c.v.GetSchemas()
++}
++
++// GetSecrets returns secrets.
++func (c *sdkVaultClient) GetSecrets(opts ...filters.Option) (*response.ResultSet[vault.Secret], error) {
++	return c.v.GetSecrets(opts...)
++}
++
++// CreateSecret creates a secret.
++func (c *sdkVaultClient) CreateSecret(secret *vault.SecretRequest) (vault.SecretCreate, error) {
++	return c.v.CreateSecret(secret)
++}
++
++// GetSecret returns a secret by name.
++func (c *sdkVaultClient) GetSecret(secretName string) (*vault.Secret, error) {
++	return c.v.GetSecret(secretName)
++}
++
++// UpdateSecret updates a secret.
++func (c *sdkVaultClient) UpdateSecret(secretName string, secret *vault.SecretRequest) error {
++	return c.v.UpdateSecret(secretName, secret)
++}
++
++// DeleteSecret deletes a secret.
++func (c *sdkVaultClient) DeleteSecret(secretName string) error {
++	return c.v.DeleteSecret(secretName)
++}
++
++// SearchSecrets searches secrets.
++func (c *sdkVaultClient) SearchSecrets(search vault.SecretSearch, opts ...filters.Option) (*response.ResultSet[vault.Secret], error) {
++	return c.v.SearchSecrets(search, opts...)
++}
+-- 
+2.47.3
+
